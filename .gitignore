@@ -1,0 +1,9 @@
+*.exe
+node_modules/
+.DS_Store
+_worker_check.js
+_plugin_test.js
+_test_driver.js
+OldTorbox.js
+OldWorker.js
+_ref_torbox.js

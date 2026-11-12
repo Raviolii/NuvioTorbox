@@ -1,0 +1,29 @@
+{
+    "name": "Nuvio TorBox Providers",
+    "version": "1.0.0",
+    "scrapers": [
+        {
+            "id": "torbox",
+            "name": "TorBox Cloud",
+            "description": "Stream cached Usenet & Torrents directly from your TorBox cloud library with high-speed CDN playback",
+            "version": "1.0.0",
+            "author": "R4VEolii",
+            "supportedTypes": [
+                "movie",
+                "tv"
+            ],
+            "filename": "Torbox.js",
+            "enabled": true,
+            "hasSettings": true,
+            "formats": [
+                "mp4",
+                "mkv"
+            ],
+            "logo": "https://torbox.app/favicon.ico",
+            "contentLanguage": [
+                "en",
+                "de"
+            ]
+        }
+    ]
+}
