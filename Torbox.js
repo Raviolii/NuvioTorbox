@@ -75,6 +75,30 @@ var STREAM_HEADERS = {
   "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 };
 
+function getRuntimePlatform() {
+  const settings = typeof globalThis !== "undefined" && globalThis.SCRAPER_SETTINGS || {};
+  const values = [
+    settings.platform,
+    settings.devicePlatform,
+    typeof globalThis !== "undefined" && globalThis.__NUVIO_PLATFORM,
+    typeof globalThis !== "undefined" && globalThis.Platform && globalThis.Platform.OS,
+    typeof globalThis !== "undefined" && globalThis.devicePlatform,
+    typeof globalThis !== "undefined" && globalThis.navigator &&
+    (globalThis.navigator.userAgent || globalThis.navigator.platform)
+  ];
+  return values.filter(Boolean).join(" ").toLowerCase();
+}
+
+// Detect Nuvio running on a Samsung Tizen TV. On Tizen, chunked uploads must
+// be small and strictly sequential (parallel fetches / big in-memory buffers
+// are unreliable), so we switch to the proven Tizen upload method.
+function isTizenRuntime() {
+  const platform = getRuntimePlatform();
+  if (/ios|iphone|ipad|ipod/.test(platform)) return false;
+  return /tizen|samsung.?tv/.test(platform) ||
+    !!(typeof globalThis !== "undefined" && (globalThis.tizen || globalThis.TIZEN));
+}
+
 function getSettings() {
   const settings = (typeof globalThis !== "undefined" && globalThis.SCRAPER_SETTINGS) || {};
   const clean = (value) => (typeof value === "string" ? value.trim() : "");
@@ -264,9 +288,22 @@ function postChunk(cleanWorkerUrl, sessionId, index, totalChunks, slice, metaHea
 
 function uploadNzbToWorker(cleanWorkerUrl, nzbBytes, metadata, opts = {}) {
   return __async(this, null, function* () {
-    const chunkSize = Math.max(16 * 1024, opts.chunkSize || (768 * 1024));
-    const concurrency = Math.max(1, opts.concurrency || 3);
-    const maxRetries = opts.maxRetries != null ? opts.maxRetries : 2;
+    const isTizen = isTizenRuntime();
+
+    // --- TIZEN TV METHOD (proven to work with Nuvio on Samsung Tizen) ---
+    // Tizen's webview is unreliable with parallel uploads and large buffers,
+    // so on a Tizen TV we force the working method: small (350 KB) chunks
+    // uploaded strictly one at a time, with a couple of extra retries.
+    // The true X-Total-Chunks is still sent on every chunk, which the worker
+    // needs to know when the complete file has arrived.
+    const TIZEN_CHUNK_SIZE = 350 * 1024;
+    const chunkSize = Math.max(16 * 1024, isTizen ? TIZEN_CHUNK_SIZE : (opts.chunkSize || (768 * 1024)));
+    const concurrency = Math.max(1, isTizen ? 1 : (opts.concurrency || 3));
+    const maxRetries = isTizen ? (opts.maxRetries != null ? Math.max(opts.maxRetries, 3) : 3) : (opts.maxRetries != null ? opts.maxRetries : 2);
+
+    if (isTizen) {
+      console.log("[TreasureMaps] Tizen TV detected — using sequential 350KB chunk upload method.");
+    }
 
     const totalChunks = Math.max(1, Math.ceil(nzbBytes.length / chunkSize));
     const sessionId = `nuvio-stream-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -321,6 +358,8 @@ function queueNzbToTorBoxFromDevice(downloadUrl, releaseTitle, apiKey, metadata 
     // to TorBox — only the NZB bytes are sent over the wire, never the URL.
     // The body is read defensively so this works whether the Nuvio runtime
     // exposes a Web ReadableStream, arrayBuffer(), or text().
+    // On a Tizen TV, uploadNzbToWorker() automatically switches to the
+    // Tizen-compatible method (small, strictly sequential chunks).
     const nzbResponse = yield fetch(downloadUrl, { headers: DEFAULT_HEADERS });
     if (!nzbResponse.ok) {
       throw new Error(`Failed to fetch NZB file from provider (${nzbResponse.status})`);
@@ -552,8 +591,12 @@ function getStreams(tmdbId, mediaType = "movie", season = null, episode = null) 
 
       if (queueResult) {
         // Briefly poll the Worker (read-only) to see if the file is already ready to stream.
-        for (let attempt = 0; attempt < 3; attempt++) {
-          if (attempt > 0) yield new Promise(resolve => setTimeout(resolve, 1500));
+        // Tizen TVs are slower to report readiness — use more, longer polls (matches the old Tizen method).
+        const isTizen = isTizenRuntime();
+        const maxPollAttempts = isTizen ? 4 : 3;
+        const pollDelayMs = isTizen ? 2000 : 1500;
+        for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
+          if (attempt > 0) yield new Promise(resolve => setTimeout(resolve, pollDelayMs));
           try {
             const checkRes = yield fetch(`${cleanWorkerUrl}/?tmdb=${tmdbId}&s=${season || ""}&e=${episode || ""}&redirect=false`);
             if (checkRes.ok) {
@@ -605,8 +648,8 @@ function onSettings() {
     { type: "text", key: "treasureMapsApiKey", label: "Treasure Maps API Key", placeholder: "Enter Treasure Maps API key", description: "Used unless overridden by the in-code CODE_TREASUREMAPS_API_KEY constant." },
     { type: "text", key: "workerUrl", label: "TorBox Worker URL", placeholder: "https://your-worker.workers.dev", description: "Cloudflare Worker URL handling lookups and relays. Used unless overridden by the in-code CODE_WORKER_URL constant." },
     { type: "text", key: "languageMode", label: "Language Mode", placeholder: "de_first (or de_only)", description: "Set to 'de_first' for German first, or 'de_only' for strictly German." },
-    { type: "text", key: "chunkSizeKB", label: "Upload Chunk Size (KB)", placeholder: "768", description: "KB per chunk. Larger = fewer round trips = faster. Keep around 1024 or below for safety." },
-    { type: "text", key: "uploadConcurrency", label: "Upload Concurrency", placeholder: "3", description: "How many chunks upload at once. 1 = sequential (safest). Higher = faster; lower if uploads fail." }
+    { type: "text", key: "chunkSizeKB", label: "Upload Chunk Size (KB)", placeholder: "768", description: "KB per chunk. Larger = fewer round trips = faster. Keep around 1024 or below for safety. (Tizen TVs always use 350 KB automatically.)" },
+    { type: "text", key: "uploadConcurrency", label: "Upload Concurrency", placeholder: "3", description: "How many chunks upload at once. 1 = sequential (safest). Higher = faster; lower if uploads fail. (Tizen TVs always use 1 — sequential — automatically.)" }
   ];
 }
 
