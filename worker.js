@@ -159,16 +159,14 @@ export default {
                 }
 
                 const chunkIndex = parseInt(request.headers.get("X-Chunk-Index") || "0", 10);
-                const totalChunks = parseInt(request.headers.get("X-Total-Chunks") || "1", 10);
-                const isLast = request.headers.get("X-Is-Last") === "true" || (chunkIndex === totalChunks - 1);
+                const totalChunks = Math.max(1, parseInt(request.headers.get("X-Total-Chunks") || "1", 10));
 
                 const chunkBuffer = await request.arrayBuffer();
 
                 if (!sessions.has(sessionId)) {
-                    sessions.set(sessionId, { chunks: [], metadata: {}, createdAt: Date.now() });
+                    sessions.set(sessionId, { chunks: [], received: 0, resolving: false, metadata: {}, createdAt: Date.now() });
                 }
                 const session = sessions.get(sessionId);
-                session.chunks[chunkIndex] = new Uint8Array(chunkBuffer);
 
                 const metaHeader = request.headers.get("X-Metadata");
                 if (metaHeader) {
@@ -177,33 +175,44 @@ export default {
                     } catch (_) {}
                 }
 
-                if (!isLast) {
-                    return jsonResponse({ status: "chunk_received", chunkIndex }, 200, corsHeaders);
+                // Idempotent: count a chunk only the first time we see it.
+                if (session.chunks[chunkIndex] === undefined) {
+                    session.chunks[chunkIndex] = new Uint8Array(chunkBuffer);
+                    session.received += 1;
                 }
 
-                const meta = session.metadata || {};
-                const torboxApiKey = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "") || meta.torboxApiKey || env.TORBOX_API_KEY;
+                // Finalize exactly once when the full set has arrived (order-independent,
+                // safe for parallel uploads). The lock is set synchronously before any
+                // await so concurrent requests can't double-forward to TorBox.
+                if (!session.resolving && session.received >= totalChunks) {
+                    session.resolving = true;
+                    const meta = session.metadata || {};
+                    const torboxApiKey = (request.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "") || meta.torboxApiKey || env.TORBOX_API_KEY;
                 
-                if (!torboxApiKey) {
-                    return jsonResponse({ error: "Missing TorBox API Key" }, 400, corsHeaders);
-                }
-
-                let totalLength = 0;
-                for (const c of session.chunks) {
-                    if (c) totalLength += c.length;
-                }
-
-                const fullNzb = new Uint8Array(totalLength);
-                let offset = 0;
-                for (const c of session.chunks) {
-                    if (c) {
-                        fullNzb.set(c, offset);
-                        offset += c.length;
+                    if (!torboxApiKey) {
+                        sessions.delete(sessionId);
+                        return jsonResponse({ error: "Missing TorBox API Key" }, 400, corsHeaders);
                     }
-                }
-                sessions.delete(sessionId);
 
-                return await forwardNzbToTorBox(fullNzb, meta, torboxApiKey.trim(), corsHeaders);
+                    let totalLength = 0;
+                    for (let i = 0; i < session.chunks.length; i++) {
+                        if (session.chunks[i]) totalLength += session.chunks[i].length;
+                    }
+
+                    const fullNzb = new Uint8Array(totalLength);
+                    let offset = 0;
+                    for (let i = 0; i < session.chunks.length; i++) {
+                        if (session.chunks[i]) {
+                            fullNzb.set(session.chunks[i], offset);
+                            offset += session.chunks[i].length;
+                        }
+                    }
+                    sessions.delete(sessionId);
+
+                    return await forwardNzbToTorBox(fullNzb, meta, torboxApiKey.trim(), corsHeaders);
+                }
+
+                return jsonResponse({ status: "chunk_received", chunkIndex, received: session.received, totalChunks }, 200, corsHeaders);
             } catch (err) {
                 return jsonResponse({ error: err.message || String(err) }, 500, corsHeaders);
             }
@@ -426,24 +435,36 @@ async function forwardNzbToTorBox(fullNzb, meta, torboxApiKey, corsHeaders) {
     bodyArray.set(fileBytes, fileHeader.length);
     bodyArray.set(middlePart, fileHeader.length + fileBytes.length);
 
-    const torboxRes = await fetch("https://api.torbox.app/v1/api/usenet/createusenetdownload", {
-        method: "POST",
-        headers: {
-            Authorization: `Bearer ${torboxApiKey}`,
-            "Content-Type": `multipart/form-data; boundary=${boundary}`
-        },
-        body: bodyArray
-    });
+    let torboxRes;
+    try {
+        torboxRes = await fetch("https://api.torbox.app/v1/api/usenet/createusenetdownload", {
+            method: "POST",
+            headers: {
+                Authorization: `Bearer ${torboxApiKey}`,
+                "Content-Type": `multipart/form-data; boundary=${boundary}`
+            },
+            body: bodyArray,
+            signal: AbortSignal.timeout(30000)
+        });
+    } catch (torboxErr) {
+        return jsonResponse({
+            error: `Failed to reach TorBox createusenetdownload: ${torboxErr.message || String(torboxErr)}`,
+            fileName,
+            fileSize: fileBytes.length
+        }, 502, corsHeaders);
+    }
 
     const torboxText = await torboxRes.text();
     let torboxJson;
     try {
         torboxJson = JSON.parse(torboxText);
     } catch (_) {
-        torboxJson = { raw: torboxText };
+        torboxJson = { raw: torboxText, httpStatus: torboxRes.status };
     }
 
-    if (torboxRes.ok || (torboxJson && torboxJson.success !== false)) {
+    const isSuccess = torboxRes.ok && (torboxJson.success === undefined || torboxJson.success !== false);
+
+    if (isSuccess) {
         const season = meta && meta.season != null ? String(meta.season) : "0";
         const episode = meta && meta.episode != null ? String(meta.episode) : "0";
         const downloadKey = `${tmdbId}${season}${episode}`;
@@ -458,9 +479,16 @@ async function forwardNzbToTorBox(fullNzb, meta, torboxApiKey, corsHeaders) {
             torboxDownloadId,
             createdAt: Date.now()
         });
+
+        return jsonResponse(Object.assign({ status: "queued" }, torboxJson), 200, corsHeaders);
     }
 
-    return jsonResponse(torboxJson, torboxRes.status, corsHeaders);
+    return jsonResponse({
+        error: (torboxJson && (torboxJson.error || torboxJson.message)) || `TorBox returned HTTP ${torboxRes.status}`,
+        torbox: torboxJson,
+        fileName,
+        fileSize: fileBytes.length
+    }, 502, corsHeaders);
 }
 
 function normalize(str) {

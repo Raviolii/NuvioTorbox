@@ -64,11 +64,17 @@ var STREAM_HEADERS = {
 function getSettings() {
   const settings = (typeof globalThis !== "undefined" && globalThis.SCRAPER_SETTINGS) || {};
   const clean = (value) => (typeof value === "string" ? value.trim() : "");
+  const toInt = (value, fallback) => {
+    const n = parseInt(clean(value), 10);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  };
   return {
     tmdbApiKey: clean(settings.tmdbApiKey),
     treasureMapsApiKey: clean(settings.treasureMapsApiKey),
     workerUrl: clean(settings.workerUrl),
-    languageMode: clean(settings.languageMode) || "de_first"
+    languageMode: clean(settings.languageMode) || "de_first",
+    chunkSizeKB: toInt(settings.chunkSizeKB, 768),
+    uploadConcurrency: toInt(settings.uploadConcurrency, 3)
   };
 }
 
@@ -193,6 +199,99 @@ function readBodyAsBytes(response) {
   });
 }
 
+function postChunk(cleanWorkerUrl, sessionId, index, totalChunks, slice, metaHeader, maxRetries) {
+  return __async(this, null, function* () {
+    let attempt = 0;
+    let lastError = null;
+    while (attempt <= maxRetries) {
+      try {
+        const res = yield fetch(`${cleanWorkerUrl}/upload-chunk`, {
+          method: "POST",
+          headers: {
+            "X-Session-Id": sessionId,
+            "X-Chunk-Index": String(index),
+            "X-Total-Chunks": String(totalChunks),
+            "X-Metadata": metaHeader,
+            "Content-Type": "application/octet-stream"
+          },
+          body: slice
+        });
+        let rawBody = "";
+        try {
+          rawBody = yield res.text();
+        } catch (_) {
+          rawBody = "";
+        }
+        let parsed = null;
+        try {
+          parsed = rawBody ? JSON.parse(rawBody) : null;
+        } catch (_) {
+          parsed = null;
+        }
+        if (!res.ok) {
+          const detail = (parsed && (parsed.error || parsed.detail || parsed.message)) || rawBody || res.statusText || "no response";
+          throw new Error(`TorBox upload failed (HTTP ${res.status}): ${detail}`);
+        }
+        if (parsed && (parsed.error || parsed.success === false)) {
+          throw new Error(`TorBox upload rejected: ${parsed.error || JSON.stringify(parsed)}`);
+        }
+        return { index, json: parsed || { status: "chunk_received", chunkIndex: index } };
+      } catch (err) {
+        lastError = err;
+        attempt += 1;
+        if (attempt <= maxRetries) {
+          yield new Promise((r) => setTimeout(r, 300 * attempt));
+        }
+      }
+    }
+    throw new Error(`Chunk ${index} failed after ${maxRetries + 1} attempts: ${lastError && (lastError.message || lastError)}`);
+  });
+}
+
+function uploadNzbToWorker(cleanWorkerUrl, nzbBytes, metadata, opts = {}) {
+  return __async(this, null, function* () {
+    const chunkSize = Math.max(16 * 1024, opts.chunkSize || (768 * 1024));
+    const concurrency = Math.max(1, opts.concurrency || 3);
+    const maxRetries = opts.maxRetries != null ? opts.maxRetries : 2;
+
+    const totalChunks = Math.max(1, Math.ceil(nzbBytes.length / chunkSize));
+    const sessionId = `nuvio-stream-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const metaHeader = encodeURIComponent(JSON.stringify(metadata || {}));
+
+    const results = [];
+    for (let start = 0; start < totalChunks; start += concurrency) {
+      const end = Math.min(start + concurrency, totalChunks);
+      const batch = [];
+      for (let i = start; i < end; i++) {
+        batch.push(
+          postChunk(
+            cleanWorkerUrl,
+            sessionId,
+            i,
+            totalChunks,
+            nzbBytes.slice(i * chunkSize, (i + 1) * chunkSize),
+            metaHeader,
+            maxRetries
+          )
+        );
+      }
+      const batchResults = yield Promise.all(batch);
+      for (const r of batchResults) results.push(r);
+    }
+
+    const nonAck = results.filter((r) => r.json && r.json.status !== "chunk_received");
+    if (nonAck.length > 0) {
+      const finalJson = nonAck[0].json;
+      if (finalJson.error || finalJson.success === false) {
+        throw new Error(`TorBox upload rejected: ${finalJson.error || JSON.stringify(finalJson)}`);
+      }
+      return finalJson;
+    }
+
+    throw new Error("Chunked upload completed but no final TorBox response was received.");
+  });
+}
+
 function queueNzbToTorBoxFromDevice(downloadUrl, releaseTitle, apiKey, metadata = {}) {
   return __async(this, null, function* () {
     if (!downloadUrl) throw new Error("Missing downloadUrl");
@@ -218,34 +317,10 @@ function queueNzbToTorBoxFromDevice(downloadUrl, releaseTitle, apiKey, metadata 
       throw new Error("Empty NZB body — nothing to upload.");
     }
 
-    const sessionId = `nuvio-stream-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const TARGET_CHUNK_SIZE = 350 * 1024;
-    const totalChunks = Math.max(1, Math.ceil(nzbBytes.length / TARGET_CHUNK_SIZE));
-    let workerResponseJson = null;
-
-    for (let i = 0; i < totalChunks; i++) {
-      const currentSlice = nzbBytes.slice(i * TARGET_CHUNK_SIZE, (i + 1) * TARGET_CHUNK_SIZE);
-      const isLast = i === totalChunks - 1;
-
-      const chunkRes = yield fetch(`${cleanWorkerUrl}/upload-chunk`, {
-        method: "POST",
-        headers: {
-          "X-Session-Id": sessionId,
-          "X-Chunk-Index": String(i),
-          "X-Total-Chunks": String(totalChunks),
-          "X-Is-Last": String(isLast),
-          "X-Metadata": encodeURIComponent(JSON.stringify(metadata)),
-          "Content-Type": "application/octet-stream"
-        },
-        body: currentSlice
-      });
-
-      if (isLast) {
-        workerResponseJson = yield chunkRes.json();
-      }
-    }
-
-    return workerResponseJson;
+    return uploadNzbToWorker(cleanWorkerUrl, nzbBytes, metadata, {
+      chunkSize: (settings.chunkSizeKB || 768) * 1024,
+      concurrency: settings.uploadConcurrency || 3
+    });
   });
 }
 
@@ -515,7 +590,9 @@ function onSettings() {
     { type: "text", key: "tmdbApiKey", label: "TMDB API Key", placeholder: "Enter TMDB API key" },
     { type: "text", key: "treasureMapsApiKey", label: "Treasure Maps API Key", placeholder: "Enter Treasure Maps API key" },
     { type: "text", key: "workerUrl", label: "TorBox Worker URL", placeholder: "https://your-worker.workers.dev", description: "Cloudflare Worker URL handling lookups and relays." },
-    { type: "text", key: "languageMode", label: "Language Mode", placeholder: "de_first (or de_only)", description: "Set to 'de_first' for German first, or 'de_only' for strictly German." }
+    { type: "text", key: "languageMode", label: "Language Mode", placeholder: "de_first (or de_only)", description: "Set to 'de_first' for German first, or 'de_only' for strictly German." },
+    { type: "text", key: "chunkSizeKB", label: "Upload Chunk Size (KB)", placeholder: "768", description: "KB per chunk. Larger = fewer round trips = faster. Keep around 1024 or below for safety." },
+    { type: "text", key: "uploadConcurrency", label: "Upload Concurrency", placeholder: "3", description: "How many chunks upload at once. 1 = sequential (safest). Higher = faster; lower if uploads fail." }
   ];
 }
 
