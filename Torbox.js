@@ -1,7 +1,14 @@
 /**
  * treasuremaps – Minimized & Clean
  * - Treasure Maps API search, TMDB API Key, Worker integration, and Language mode.
- * - Everything configured via onSettings().
+ * - Configured via onSettings().
+ *
+ * Key resolution order:
+ *   1. In-code overrides below (CODE_* constants) – if you fill them in, they win.
+ *   2. onSettings() values (TMDB API Key / Treasure Maps API Key / Worker URL).
+ *
+ * NOTE: This file is for GitHub – keep the CODE_* constants EMPTY by default.
+ * Fill them in only in your private/local copy if you want them to override settings.
  */
 var __defProp = Object.defineProperty;
 var __getOwnPropSymbols = Object.getOwnPropertySymbols;
@@ -40,6 +47,13 @@ var __async = (__this, __arguments, generator) => {
   });
 };
 
+// ─── In-code overrides (OPTIONAL) ─────────────────────────────────────────────
+// If any of these are non-empty, they override the values from onSettings().
+// Keep them empty for the GitHub copy – then the onSettings values are used.
+const CODE_TMDB_API_KEY = "";
+const CODE_TREASUREMAPS_API_KEY = "";
+const CODE_WORKER_URL = "";
+
 var SCRAPER_ID = "treasuremaps";
 
 function __get_scraper_id() {
@@ -69,9 +83,9 @@ function getSettings() {
     return Number.isFinite(n) && n > 0 ? n : fallback;
   };
   return {
-    tmdbApiKey: clean(settings.tmdbApiKey),
-    treasureMapsApiKey: clean(settings.treasureMapsApiKey),
-    workerUrl: clean(settings.workerUrl),
+    tmdbApiKey: clean(CODE_TMDB_API_KEY) || clean(settings.tmdbApiKey),
+    treasureMapsApiKey: clean(CODE_TREASUREMAPS_API_KEY) || clean(settings.treasureMapsApiKey),
+    workerUrl: clean(CODE_WORKER_URL) || clean(settings.workerUrl),
     languageMode: clean(settings.languageMode) || "de_first",
     chunkSizeKB: toInt(settings.chunkSizeKB, 768),
     uploadConcurrency: toInt(settings.uploadConcurrency, 3)
@@ -587,9 +601,9 @@ function getSearchResults(tmdbId, mediaType = "movie", season = null, episode = 
 function onSettings() {
   return [
     { type: "header", label: "Treasure Maps Configuration" },
-    { type: "text", key: "tmdbApiKey", label: "TMDB API Key", placeholder: "Enter TMDB API key" },
-    { type: "text", key: "treasureMapsApiKey", label: "Treasure Maps API Key", placeholder: "Enter Treasure Maps API key" },
-    { type: "text", key: "workerUrl", label: "TorBox Worker URL", placeholder: "https://your-worker.workers.dev", description: "Cloudflare Worker URL handling lookups and relays." },
+    { type: "text", key: "tmdbApiKey", label: "TMDB API Key", placeholder: "Enter TMDB API key", description: "Used unless overridden by the in-code CODE_TMDB_API_KEY constant." },
+    { type: "text", key: "treasureMapsApiKey", label: "Treasure Maps API Key", placeholder: "Enter Treasure Maps API key", description: "Used unless overridden by the in-code CODE_TREASUREMAPS_API_KEY constant." },
+    { type: "text", key: "workerUrl", label: "TorBox Worker URL", placeholder: "https://your-worker.workers.dev", description: "Cloudflare Worker URL handling lookups and relays. Used unless overridden by the in-code CODE_WORKER_URL constant." },
     { type: "text", key: "languageMode", label: "Language Mode", placeholder: "de_first (or de_only)", description: "Set to 'de_first' for German first, or 'de_only' for strictly German." },
     { type: "text", key: "chunkSizeKB", label: "Upload Chunk Size (KB)", placeholder: "768", description: "KB per chunk. Larger = fewer round trips = faster. Keep around 1024 or below for safety." },
     { type: "text", key: "uploadConcurrency", label: "Upload Concurrency", placeholder: "3", description: "How many chunks upload at once. 1 = sequential (safest). Higher = faster; lower if uploads fail." }
