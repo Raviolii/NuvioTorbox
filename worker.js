@@ -254,6 +254,10 @@ export default {
                 }
 
                 if (!match) {
+                    // Status protocol: expected states always come back as 200 with a
+                    // `status` field, so clients can parse the body instead of
+                    // guessing from 404/502 error codes (which Nuvio TVs surface
+                    // as opaque failures).
                     return jsonResponse({
                         status: 'not_found',
                         tmdb: tmdbId,
@@ -263,13 +267,23 @@ export default {
                             usenet_count: usenetResult.list.length,
                             torrents_count: torrentResult.list.length,
                         }
-                    }, 404, corsHeaders);
+                    }, 200, corsHeaders);
                 }
 
                 const streamUrl = await getDirectLink(match, apiKey);
 
                 if (!streamUrl) {
-                    return jsonResponse({ error: 'Failed to generate TorBox download link.' }, 502, corsHeaders);
+                    // The file exists in the TorBox list but the link is not
+                    // ready yet — i.e. it is almost certainly still being
+                    // downloaded/processed. Report that as a normal state
+                    // (200) instead of a 502 so clients can simply poll again.
+                    return jsonResponse({
+                        status: 'downloading',
+                        source: match.type,
+                        release_name: match.itemName,
+                        file_name: match.fileName,
+                        reason: 'link_not_ready'
+                    }, 200, corsHeaders);
                 }
 
                 if (redirectMode) {
