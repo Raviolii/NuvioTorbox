@@ -99,44 +99,6 @@ function isTizenRuntime() {
     !!(typeof globalThis !== "undefined" && (globalThis.tizen || globalThis.TIZEN));
 }
 
-// --- TIZEN-SAFE DELAY -------------------------------------------------------
-// On Tizen TV (Nuvio sandbox) the `setTimeout` identifier can be completely
-// undefined, which crashes the upload with "setTimeout is not defined".
-// This helper resolves a timer function defensively and falls back to
-// microtasks / a capped synchronous wait so delays never throw.
-function resolveSetTimeout() {
-  if (typeof setTimeout === "function") return setTimeout;
-  const sources = [
-    typeof globalThis !== "undefined" ? globalThis : null,
-    typeof window !== "undefined" ? window : null,
-    typeof self !== "undefined" ? self : null
-  ];
-  for (const src of sources) {
-    if (src && typeof src.setTimeout === "function") return src.setTimeout;
-  }
-  return null;
-}
-
-function waitMs(ms) {
-  const timer = resolveSetTimeout();
-  if (timer) return new Promise((resolve) => timer(resolve, ms));
-
-  // No timer API available (e.g. Tizen plugin sandbox): yield via microtasks.
-  if (typeof queueMicrotask === "function") {
-    return new Promise((resolve) => {
-      let ticks = 0;
-      const step = () => { if (++ticks >= 24) return resolve(); queueMicrotask(step); };
-      queueMicrotask(step);
-    });
-  }
-
-  // Last resort: bounded synchronous wait (capped at 100 ms so we never
-  // lock the TV's UI thread for long).
-  const end = Date.now() + Math.min(Math.max(0, ms | 0), 100);
-  while (Date.now() < end) { /* spin */ }
-  return Promise.resolve();
-}
-
 function getSettings() {
   const settings = (typeof globalThis !== "undefined" && globalThis.SCRAPER_SETTINGS) || {};
   const clean = (value) => (typeof value === "string" ? value.trim() : "");
@@ -316,7 +278,7 @@ function postChunk(cleanWorkerUrl, sessionId, index, totalChunks, slice, metaHea
         lastError = err;
         attempt += 1;
         if (attempt <= maxRetries) {
-          yield waitMs(300 * attempt);
+          yield new Promise((r) => setTimeout(r, 300 * attempt));
         }
       }
     }
@@ -571,45 +533,6 @@ function pickCandidateReleases(results, languageMode = "de_first") {
   return [...germanReleases, ...nonGermanReleases];
 }
 
-// --- Worker "status protocol" helpers -------------------------------------
-// The Worker always answers the root lookup with HTTP 200 plus a `status`
-// field ("ready" | "downloading" | "not_found"). We never have to rely on
-// 404/502 error codes, which Nuvio TVs surface as opaque fetch failures.
-
-function workerLookupUrl(cleanWorkerUrl, tmdbId, season, episode) {
-  return `${cleanWorkerUrl}/?tmdb=${tmdbId}&s=${season || ""}&e=${episode || ""}&redirect=false`;
-}
-
-function makeReadyStream(json) {
-  return [{
-    name: `TorBox · ${json.file_name || json.release_name}`,
-    title: `TorBox · ${json.file_name || json.release_name}`,
-    url: json.stream_url,
-    quality: "Cached",
-    headers: DEFAULT_HEADERS,
-    description: `Ready to play from TorBox (${json.source})`,
-    provider: "torbox-library"
-  }];
-}
-
-function pollWorkerForReady(cleanWorkerUrl, tmdbId, season, episode, maxAttempts, delayMs) {
-  return __async(this, null, function* () {
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      if (attempt > 0) yield waitMs(delayMs);
-      try {
-        const res = yield fetch(workerLookupUrl(cleanWorkerUrl, tmdbId, season, episode));
-        if (res.ok) {
-          const json = yield res.json();
-          if (json && json.status === "ready" && json.stream_url) {
-            return makeReadyStream(json);
-          }
-        }
-      } catch (_) {}
-    }
-    return null;
-  });
-}
-
 function getStreams(tmdbId, mediaType = "movie", season = null, episode = null) {
   return __async(this, null, function* () {
     const settings = getSettings();
@@ -622,38 +545,29 @@ function getStreams(tmdbId, mediaType = "movie", season = null, episode = null) 
       return [];
     }
 
-    // 1. Check Worker for existing ready streams (status protocol: ready / downloading / not_found)
-    let localJson = null;
+    // 1. Check Worker for existing ready streams
     try {
-      const res = yield fetch(workerLookupUrl(cleanWorkerUrl, tmdbId, season, episode));
+      const workerLookupUrl = `${cleanWorkerUrl}/?tmdb=${tmdbId}&s=${season || ""}&e=${episode || ""}&redirect=false`;
+      const res = yield fetch(workerLookupUrl);
       if (res.ok) {
-        localJson = yield res.json();
+        const json = yield res.json();
+        if (json.status === "ready" && json.stream_url) {
+          return [{
+            name: `TorBox · ${json.file_name || json.release_name}`,
+            title: `TorBox · ${json.file_name || json.release_name}`,
+            url: json.stream_url,
+            quality: "Cached",
+            headers: DEFAULT_HEADERS,
+            description: `Ready to play from TorBox (${json.source})`,
+            provider: "torbox-library"
+          }];
+        }
       }
     } catch (err) {
       console.warn(`[TreasureMaps] Worker local stream check failed: ${err.message || err}`);
     }
 
-    const localStatus = (localJson && localJson.status) || null;
-
-    if (localStatus === "ready" && localJson.stream_url) {
-      return makeReadyStream(localJson);
-    }
-
-    // 2. Already queued on TorBox (Worker reports "downloading") → the NZB was
-    //    uploaded before and TorBox is still processing. Poll patiently instead
-    //    of re-uploading the same NZB (Tizen TVs are slower to report readiness).
-    if (localStatus === "downloading") {
-      console.log(`[TreasureMaps] Worker reports download in progress (${localJson.file_name || localJson.release_name || "queued"}) — polling for readiness.`);
-      const isTizen = isTizenRuntime();
-      const readyStream = yield pollWorkerForReady(cleanWorkerUrl, tmdbId, season, episode, isTizen ? 8 : 6, isTizen ? 2500 : 2000);
-      if (readyStream) {
-        return readyStream;
-      }
-      // Still not ready — fall through to (re-)queue below so the user always
-      // gets the same "Downloading" placeholder flow as before.
-    }
-
-    // 3. Not found locally, search TreasureMaps and upload the single best NZB via Worker (exactly once)
+    // 2. If not found locally, search TreasureMaps and upload the single best NZB via Worker (exactly once)
     const searchData = yield searchTreasureMaps(tmdbId, mediaType, season, episode, settings);
     const { results } = searchData;
     const candidates = pickCandidateReleases(results, settings.languageMode);
@@ -679,9 +593,27 @@ function getStreams(tmdbId, mediaType = "movie", season = null, episode = null) 
         // Briefly poll the Worker (read-only) to see if the file is already ready to stream.
         // Tizen TVs are slower to report readiness — use more, longer polls (matches the old Tizen method).
         const isTizen = isTizenRuntime();
-        const readyStream = yield pollWorkerForReady(cleanWorkerUrl, tmdbId, season, episode, isTizen ? 4 : 3, isTizen ? 2000 : 1500);
-        if (readyStream) {
-          return readyStream;
+        const maxPollAttempts = isTizen ? 4 : 3;
+        const pollDelayMs = isTizen ? 2000 : 1500;
+        for (let attempt = 0; attempt < maxPollAttempts; attempt++) {
+          if (attempt > 0) yield new Promise(resolve => setTimeout(resolve, pollDelayMs));
+          try {
+            const checkRes = yield fetch(`${cleanWorkerUrl}/?tmdb=${tmdbId}&s=${season || ""}&e=${episode || ""}&redirect=false`);
+            if (checkRes.ok) {
+              const checkJson = yield checkRes.json();
+              if (checkJson.status === "ready" && checkJson.stream_url) {
+                return [{
+                  name: `TorBox · ${checkJson.file_name || checkJson.release_name}`,
+                  title: `TorBox · ${checkJson.file_name || checkJson.release_name}`,
+                  url: checkJson.stream_url,
+                  quality: "Cached",
+                  headers: DEFAULT_HEADERS,
+                  description: `Ready to play from TorBox (${checkJson.source})`,
+                  provider: "torbox-library"
+                }];
+              }
+            }
+          } catch (_) {}
         }
 
         return [{
