@@ -1,14 +1,7 @@
 /**
  * treasuremaps – Minimized & Clean
  * - Treasure Maps API search, TMDB API Key, Worker integration, and Language mode.
- * - Configured via onSettings().
- *
- * Key resolution order:
- *   1. In-code overrides below (CODE_* constants) – if you fill them in, they win.
- *   2. onSettings() values (TMDB API Key / Treasure Maps API Key / Worker URL).
- *
- * NOTE: This file is for GitHub – keep the CODE_* constants EMPTY by default.
- * Fill them in only in your private/local copy if you want them to override settings.
+ * - Everything configured via onSettings().
  */
 var __defProp = Object.defineProperty;
 var __getOwnPropSymbols = Object.getOwnPropertySymbols;
@@ -47,13 +40,6 @@ var __async = (__this, __arguments, generator) => {
   });
 };
 
-// ─── In-code overrides (OPTIONAL) ─────────────────────────────────────────────
-// If any of these are non-empty, they override the values from onSettings().
-// Keep them empty for the GitHub copy – then the onSettings values are used.
-const CODE_TMDB_API_KEY = "";
-const CODE_TREASUREMAPS_API_KEY = "";
-const CODE_WORKER_URL = "";
-
 var SCRAPER_ID = "treasuremaps";
 
 function __get_scraper_id() {
@@ -75,68 +61,6 @@ var STREAM_HEADERS = {
   "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 };
 
-function getRuntimePlatform() {
-  const settings = typeof globalThis !== "undefined" && globalThis.SCRAPER_SETTINGS || {};
-  const values = [
-    settings.platform,
-    settings.devicePlatform,
-    typeof globalThis !== "undefined" && globalThis.__NUVIO_PLATFORM,
-    typeof globalThis !== "undefined" && globalThis.Platform && globalThis.Platform.OS,
-    typeof globalThis !== "undefined" && globalThis.devicePlatform,
-    typeof globalThis !== "undefined" && globalThis.navigator &&
-    (globalThis.navigator.userAgent || globalThis.navigator.platform)
-  ];
-  return values.filter(Boolean).join(" ").toLowerCase();
-}
-
-// Detect Nuvio running on a Samsung Tizen TV. On Tizen, chunked uploads must
-// be small and strictly sequential (parallel fetches / big in-memory buffers
-// are unreliable), so we switch to the proven Tizen upload method.
-function isTizenRuntime() {
-  const platform = getRuntimePlatform();
-  if (/ios|iphone|ipad|ipod/.test(platform)) return false;
-  return /tizen|samsung.?tv/.test(platform) ||
-    !!(typeof globalThis !== "undefined" && (globalThis.tizen || globalThis.TIZEN));
-}
-
-// --- TIZEN-SAFE DELAY -------------------------------------------------------
-// On Tizen TV (Nuvio sandbox) the `setTimeout` identifier can be completely
-// undefined, which crashes the upload with "setTimeout is not defined".
-// This helper resolves a timer function defensively and falls back to
-// microtasks / a capped synchronous wait so delays never throw.
-function resolveSetTimeout() {
-  if (typeof setTimeout === "function") return setTimeout;
-  const sources = [
-    typeof globalThis !== "undefined" ? globalThis : null,
-    typeof window !== "undefined" ? window : null,
-    typeof self !== "undefined" ? self : null
-  ];
-  for (const src of sources) {
-    if (src && typeof src.setTimeout === "function") return src.setTimeout;
-  }
-  return null;
-}
-
-function waitMs(ms) {
-  const timer = resolveSetTimeout();
-  if (timer) return new Promise((resolve) => timer(resolve, ms));
-
-  // No timer API available (e.g. Tizen plugin sandbox): yield via microtasks.
-  if (typeof queueMicrotask === "function") {
-    return new Promise((resolve) => {
-      let ticks = 0;
-      const step = () => { if (++ticks >= 24) return resolve(); queueMicrotask(step); };
-      queueMicrotask(step);
-    });
-  }
-
-  // Last resort: bounded synchronous wait (capped at 100 ms so we never
-  // lock the TV's UI thread for long).
-  const end = Date.now() + Math.min(Math.max(0, ms | 0), 100);
-  while (Date.now() < end) { /* spin */ }
-  return Promise.resolve();
-}
-
 function getSettings() {
   const settings = (typeof globalThis !== "undefined" && globalThis.SCRAPER_SETTINGS) || {};
   const clean = (value) => (typeof value === "string" ? value.trim() : "");
@@ -145,9 +69,9 @@ function getSettings() {
     return Number.isFinite(n) && n > 0 ? n : fallback;
   };
   return {
-    tmdbApiKey: clean(CODE_TMDB_API_KEY) || clean(settings.tmdbApiKey),
-    treasureMapsApiKey: clean(CODE_TREASUREMAPS_API_KEY) || clean(settings.treasureMapsApiKey),
-    workerUrl: clean(CODE_WORKER_URL) || clean(settings.workerUrl),
+    tmdbApiKey: clean(settings.tmdbApiKey),
+    treasureMapsApiKey: clean(settings.treasureMapsApiKey),
+    workerUrl: clean(settings.workerUrl),
     languageMode: clean(settings.languageMode) || "de_first",
     chunkSizeKB: toInt(settings.chunkSizeKB, 768),
     uploadConcurrency: toInt(settings.uploadConcurrency, 3)
@@ -316,7 +240,7 @@ function postChunk(cleanWorkerUrl, sessionId, index, totalChunks, slice, metaHea
         lastError = err;
         attempt += 1;
         if (attempt <= maxRetries) {
-          yield waitMs(300 * attempt);
+          yield new Promise((r) => setTimeout(r, 300 * attempt));
         }
       }
     }
@@ -326,85 +250,45 @@ function postChunk(cleanWorkerUrl, sessionId, index, totalChunks, slice, metaHea
 
 function uploadNzbToWorker(cleanWorkerUrl, nzbBytes, metadata, opts = {}) {
   return __async(this, null, function* () {
-    const isTizen = isTizenRuntime();
-
-    // --- TIZEN TV METHOD (proven to work with Nuvio on Samsung Tizen) ---
-    // Tizen's webview is unreliable with parallel uploads and large buffers,
-    // so on a Tizen TV we force the working method: small (350 KB) chunks
-    // uploaded strictly one at a time, with a couple of extra retries.
-    // The true X-Total-Chunks is still sent on every chunk, which the worker
-    // needs to know when the complete file has arrived.
-    const TIZEN_CHUNK_SIZE = 350 * 1024;
-    const chunkSize = Math.max(16 * 1024, isTizen ? TIZEN_CHUNK_SIZE : (opts.chunkSize || (768 * 1024)));
-    const concurrency = Math.max(1, isTizen ? 1 : (opts.concurrency || 3));
-    const maxRetries = isTizen ? (opts.maxRetries != null ? Math.max(opts.maxRetries, 3) : 3) : (opts.maxRetries != null ? opts.maxRetries : 2);
-
-    if (isTizen) {
-      console.log("[TreasureMaps] Tizen TV detected — using sequential 350KB chunk upload method.");
-    }
+    const chunkSize = Math.max(16 * 1024, opts.chunkSize || (768 * 1024));
+    const concurrency = Math.max(1, opts.concurrency || 3);
+    const maxRetries = opts.maxRetries != null ? opts.maxRetries : 2;
 
     const totalChunks = Math.max(1, Math.ceil(nzbBytes.length / chunkSize));
     const sessionId = `nuvio-stream-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const metaHeader = encodeURIComponent(JSON.stringify(metadata || {}));
 
-    // The Worker assembles the chunks and, when the final chunk arrives,
-    // forwards the full NZB to TorBox. That forwarding step can fail
-    // transiently (network blip, TorBox 5xx). In that case the Worker KEEPS
-    // its session, so we can simply resend the chunks (its chunk counting is
-    // idempotent) to re-trigger the forward. One full round per attempt.
-    const MAX_ROUNDS = isTizen ? 3 : 2;
-    let lastError = null;
-
-    for (let round = 0; round < MAX_ROUNDS; round++) {
-      const results = [];
-      let roundError = null;
-      try {
-        for (let start = 0; start < totalChunks; start += concurrency) {
-          const end = Math.min(start + concurrency, totalChunks);
-          const batch = [];
-          for (let i = start; i < end; i++) {
-            batch.push(
-              postChunk(
-                cleanWorkerUrl,
-                sessionId,
-                i,
-                totalChunks,
-                nzbBytes.slice(i * chunkSize, (i + 1) * chunkSize),
-                metaHeader,
-                maxRetries
-              )
-            );
-          }
-          const batchResults = yield Promise.all(batch);
-          for (const r of batchResults) results.push(r);
-        }
-      } catch (err) {
-        // A chunk (usually the final one) kept failing — carry its detail
-        // (it contains the Worker's actual error, e.g. the TorBox response).
-        roundError = err;
+    const results = [];
+    for (let start = 0; start < totalChunks; start += concurrency) {
+      const end = Math.min(start + concurrency, totalChunks);
+      const batch = [];
+      for (let i = start; i < end; i++) {
+        batch.push(
+          postChunk(
+            cleanWorkerUrl,
+            sessionId,
+            i,
+            totalChunks,
+            nzbBytes.slice(i * chunkSize, (i + 1) * chunkSize),
+            metaHeader,
+            maxRetries
+          )
+        );
       }
-
-      if (!roundError) {
-        const nonAck = results.filter((r) => r.json && r.json.status !== "chunk_received");
-        if (nonAck.length > 0) {
-          const finalJson = nonAck[0].json;
-          if (finalJson.error || finalJson.success === false) {
-            throw new Error(`TorBox upload rejected: ${finalJson.error || JSON.stringify(finalJson)}`);
-          }
-          return finalJson;
-        }
-        lastError = new Error("Worker accepted all chunks but the TorBox forward did not complete (transient failure).");
-      } else {
-        lastError = roundError;
-      }
-
-      if (round < MAX_ROUNDS - 1) {
-        console.log(`[TreasureMaps] Upload round ${round + 1}/${MAX_ROUNDS} did not reach TorBox — resending chunks to retry the forward.`);
-        yield waitMs(1000 * (round + 1));
-      }
+      const batchResults = yield Promise.all(batch);
+      for (const r of batchResults) results.push(r);
     }
 
-    throw new Error(`Chunked upload to TorBox failed after ${MAX_ROUNDS} round(s): ${lastError && (lastError.message || lastError)}`);
+    const nonAck = results.filter((r) => r.json && r.json.status !== "chunk_received");
+    if (nonAck.length > 0) {
+      const finalJson = nonAck[0].json;
+      if (finalJson.error || finalJson.success === false) {
+        throw new Error(`TorBox upload rejected: ${finalJson.error || JSON.stringify(finalJson)}`);
+      }
+      return finalJson;
+    }
+
+    throw new Error("Chunked upload completed but no final TorBox response was received.");
   });
 }
 
@@ -423,8 +307,6 @@ function queueNzbToTorBoxFromDevice(downloadUrl, releaseTitle, apiKey, metadata 
     // to TorBox — only the NZB bytes are sent over the wire, never the URL.
     // The body is read defensively so this works whether the Nuvio runtime
     // exposes a Web ReadableStream, arrayBuffer(), or text().
-    // On a Tizen TV, uploadNzbToWorker() automatically switches to the
-    // Tizen-compatible method (small, strictly sequential chunks).
     const nzbResponse = yield fetch(downloadUrl, { headers: DEFAULT_HEADERS });
     if (!nzbResponse.ok) {
       throw new Error(`Failed to fetch NZB file from provider (${nzbResponse.status})`);
@@ -598,45 +480,6 @@ function pickCandidateReleases(results, languageMode = "de_first") {
   return [...germanReleases, ...nonGermanReleases];
 }
 
-// --- Worker "status protocol" helpers -------------------------------------
-// The Worker always answers the root lookup with HTTP 200 plus a `status`
-// field ("ready" | "downloading" | "not_found"). We never have to rely on
-// 404/502 error codes, which Nuvio TVs surface as opaque fetch failures.
-
-function workerLookupUrl(cleanWorkerUrl, tmdbId, season, episode) {
-  return `${cleanWorkerUrl}/?tmdb=${tmdbId}&s=${season || ""}&e=${episode || ""}&redirect=false`;
-}
-
-function makeReadyStream(json) {
-  return [{
-    name: `TorBox · ${json.file_name || json.release_name}`,
-    title: `TorBox · ${json.file_name || json.release_name}`,
-    url: json.stream_url,
-    quality: "Cached",
-    headers: DEFAULT_HEADERS,
-    description: `Ready to play from TorBox (${json.source})`,
-    provider: "torbox-library"
-  }];
-}
-
-function pollWorkerForReady(cleanWorkerUrl, tmdbId, season, episode, maxAttempts, delayMs) {
-  return __async(this, null, function* () {
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      if (attempt > 0) yield waitMs(delayMs);
-      try {
-        const res = yield fetch(workerLookupUrl(cleanWorkerUrl, tmdbId, season, episode));
-        if (res.ok) {
-          const json = yield res.json();
-          if (json && json.status === "ready" && json.stream_url) {
-            return makeReadyStream(json);
-          }
-        }
-      } catch (_) {}
-    }
-    return null;
-  });
-}
-
 function getStreams(tmdbId, mediaType = "movie", season = null, episode = null) {
   return __async(this, null, function* () {
     const settings = getSettings();
@@ -649,38 +492,29 @@ function getStreams(tmdbId, mediaType = "movie", season = null, episode = null) 
       return [];
     }
 
-    // 1. Check Worker for existing ready streams (status protocol: ready / downloading / not_found)
-    let localJson = null;
+    // 1. Check Worker for existing ready streams
     try {
-      const res = yield fetch(workerLookupUrl(cleanWorkerUrl, tmdbId, season, episode));
+      const workerLookupUrl = `${cleanWorkerUrl}/?tmdb=${tmdbId}&s=${season || ""}&e=${episode || ""}&redirect=false`;
+      const res = yield fetch(workerLookupUrl);
       if (res.ok) {
-        localJson = yield res.json();
+        const json = yield res.json();
+        if (json.status === "ready" && json.stream_url) {
+          return [{
+            name: `TorBox · ${json.file_name || json.release_name}`,
+            title: `TorBox · ${json.file_name || json.release_name}`,
+            url: json.stream_url,
+            quality: "Cached",
+            headers: DEFAULT_HEADERS,
+            description: `Ready to play from TorBox (${json.source})`,
+            provider: "torbox-library"
+          }];
+        }
       }
     } catch (err) {
       console.warn(`[TreasureMaps] Worker local stream check failed: ${err.message || err}`);
     }
 
-    const localStatus = (localJson && localJson.status) || null;
-
-    if (localStatus === "ready" && localJson.stream_url) {
-      return makeReadyStream(localJson);
-    }
-
-    // 2. Already queued on TorBox (Worker reports "downloading") → the NZB was
-    //    uploaded before and TorBox is still processing. Poll patiently instead
-    //    of re-uploading the same NZB (Tizen TVs are slower to report readiness).
-    if (localStatus === "downloading") {
-      console.log(`[TreasureMaps] Worker reports download in progress (${localJson.file_name || localJson.release_name || "queued"}) — polling for readiness.`);
-      const isTizen = isTizenRuntime();
-      const readyStream = yield pollWorkerForReady(cleanWorkerUrl, tmdbId, season, episode, isTizen ? 8 : 6, isTizen ? 2500 : 2000);
-      if (readyStream) {
-        return readyStream;
-      }
-      // Still not ready — fall through to (re-)queue below so the user always
-      // gets the same "Downloading" placeholder flow as before.
-    }
-
-    // 3. Not found locally, search TreasureMaps and upload the single best NZB via Worker (exactly once)
+    // 2. If not found locally, search TreasureMaps and upload the single best NZB via Worker (exactly once)
     const searchData = yield searchTreasureMaps(tmdbId, mediaType, season, episode, settings);
     const { results } = searchData;
     const candidates = pickCandidateReleases(results, settings.languageMode);
@@ -704,11 +538,25 @@ function getStreams(tmdbId, mediaType = "movie", season = null, episode = null) 
 
       if (queueResult) {
         // Briefly poll the Worker (read-only) to see if the file is already ready to stream.
-        // Tizen TVs are slower to report readiness — use more, longer polls (matches the old Tizen method).
-        const isTizen = isTizenRuntime();
-        const readyStream = yield pollWorkerForReady(cleanWorkerUrl, tmdbId, season, episode, isTizen ? 4 : 3, isTizen ? 2000 : 1500);
-        if (readyStream) {
-          return readyStream;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (attempt > 0) yield new Promise(resolve => setTimeout(resolve, 1500));
+          try {
+            const checkRes = yield fetch(`${cleanWorkerUrl}/?tmdb=${tmdbId}&s=${season || ""}&e=${episode || ""}&redirect=false`);
+            if (checkRes.ok) {
+              const checkJson = yield checkRes.json();
+              if (checkJson.status === "ready" && checkJson.stream_url) {
+                return [{
+                  name: `TorBox · ${checkJson.file_name || checkJson.release_name}`,
+                  title: `TorBox · ${checkJson.file_name || checkJson.release_name}`,
+                  url: checkJson.stream_url,
+                  quality: "Cached",
+                  headers: DEFAULT_HEADERS,
+                  description: `Ready to play from TorBox (${checkJson.source})`,
+                  provider: "torbox-library"
+                }];
+              }
+            }
+          } catch (_) {}
         }
 
         return [{
@@ -739,12 +587,12 @@ function getSearchResults(tmdbId, mediaType = "movie", season = null, episode = 
 function onSettings() {
   return [
     { type: "header", label: "Treasure Maps Configuration" },
-    { type: "text", key: "tmdbApiKey", label: "TMDB API Key", placeholder: "Enter TMDB API key", description: "Used unless overridden by the in-code CODE_TMDB_API_KEY constant." },
-    { type: "text", key: "treasureMapsApiKey", label: "Treasure Maps API Key", placeholder: "Enter Treasure Maps API key", description: "Used unless overridden by the in-code CODE_TREASUREMAPS_API_KEY constant." },
-    { type: "text", key: "workerUrl", label: "TorBox Worker URL", placeholder: "https://your-worker.workers.dev", description: "Cloudflare Worker URL handling lookups and relays. Used unless overridden by the in-code CODE_WORKER_URL constant." },
+    { type: "text", key: "tmdbApiKey", label: "TMDB API Key", placeholder: "Enter TMDB API key" },
+    { type: "text", key: "treasureMapsApiKey", label: "Treasure Maps API Key", placeholder: "Enter Treasure Maps API key" },
+    { type: "text", key: "workerUrl", label: "TorBox Worker URL", placeholder: "https://your-worker.workers.dev", description: "Cloudflare Worker URL handling lookups and relays." },
     { type: "text", key: "languageMode", label: "Language Mode", placeholder: "de_first (or de_only)", description: "Set to 'de_first' for German first, or 'de_only' for strictly German." },
-    { type: "text", key: "chunkSizeKB", label: "Upload Chunk Size (KB)", placeholder: "768", description: "KB per chunk. Larger = fewer round trips = faster. Keep around 1024 or below for safety. (Tizen TVs always use 350 KB automatically.)" },
-    { type: "text", key: "uploadConcurrency", label: "Upload Concurrency", placeholder: "3", description: "How many chunks upload at once. 1 = sequential (safest). Higher = faster; lower if uploads fail. (Tizen TVs always use 1 — sequential — automatically.)" }
+    { type: "text", key: "chunkSizeKB", label: "Upload Chunk Size (KB)", placeholder: "768", description: "KB per chunk. Larger = fewer round trips = faster. Keep around 1024 or below for safety." },
+    { type: "text", key: "uploadConcurrency", label: "Upload Concurrency", placeholder: "3", description: "How many chunks upload at once. 1 = sequential (safest). Higher = faster; lower if uploads fail." }
   ];
 }
 
