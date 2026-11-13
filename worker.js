@@ -465,77 +465,117 @@ async function forwardNzbToTorBox(fullNzb, meta, torboxApiKey, corsHeaders) {
     bodyArray.set(fileBytes, fileHeader.length);
     bodyArray.set(middlePart, fileHeader.length + fileBytes.length);
 
-    let torboxRes;
-    try {
-        torboxRes = await fetch("https://api.torbox.app/v1/api/usenet/createusenetdownload", {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${torboxApiKey}`,
-                "Content-Type": `multipart/form-data; boundary=${boundary}`
-            },
-            body: bodyArray,
-            signal: AbortSignal.timeout(30000)
-        });
-    } catch (torboxErr) {
-        // DIAG: network/timeout/TLS failure reaching TorBox (NOT a TorBox rejection).
+    // --- TorBox forward with bounded retry ------------------------------------
+    // TorBox's createusenetdownload intermittently returns a transient 5xx
+    // ("DOWNLOAD_SERVER_ERROR — Failed to create download. Please try again later."),
+    // most often for larger NZBs (reproduced: 500s on ~777 KB NZBs, ~900 ms each).
+    // It self-heals on retry, but the client-side retries fire only a few ms apart
+    // (postChunk: 300*attempt, round: 1000*round), so they all land inside the SAME
+    // short TorBox outage window and fail together. We therefore retry HERE — the one
+    // place both /upload-chunk and /relay-url converge — with a small backoff so
+    // consecutive attempts are spread across the outage.
+    //
+    // Retry policy: ONLY transient failures are retried (network errors / timeouts, or
+    // HTTP 5xx). Definitive 4xx client errors (e.g. a malformed request) are returned
+    // immediately — hammering them just wastes TorBox capacity.
+    const TORBOX_URL = "https://api.torbox.app/v1/api/usenet/createusenetdownload";
+    const MAX_ATTEMPTS = 3;
+    const TORBOX_TIMEOUT_MS = 10000; // generous for a queue-API call, bounded so total time stays client-safe
+    const BACKOFF_MS = [600, 1500];  // wait after attempt 1 and attempt 2
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        let torboxRes;
         try {
-            console.error(`[forwardNzbToTorBox] NETWORK/TIMEOUT: file=${fileName} fileSize=${fileBytes.length} err=${torboxErr.message || String(torboxErr)} name=${torboxErr && torboxErr.name}`);
+            torboxRes = await fetch(TORBOX_URL, {
+                method: "POST",
+                headers: {
+                    Authorization: `Bearer ${torboxApiKey}`,
+                    "Content-Type": `multipart/form-data; boundary=${boundary}`
+                },
+                body: bodyArray,
+                signal: AbortSignal.timeout(TORBOX_TIMEOUT_MS)
+            });
+        } catch (torboxErr) {
+            // DIAG: network/timeout/TLS failure reaching TorBox (NOT a TorBox rejection).
+            const retrying = attempt < MAX_ATTEMPTS;
+            try {
+                console.error(`[forwardNzbToTorBox] NETWORK/TIMEOUT attempt=${attempt}/${MAX_ATTEMPTS}: file=${fileName} fileSize=${fileBytes.length} err=${torboxErr.message || String(torboxErr)} name=${torboxErr && torboxErr.name}${retrying ? " — retrying" : ""}`);
+            } catch (_) { /* ignore */ }
+            if (retrying) {
+                await sleep(BACKOFF_MS[attempt - 1] || BACKOFF_MS[BACKOFF_MS.length - 1]);
+                continue;
+            }
+            return jsonResponse({
+                error: `Failed to reach TorBox createusenetdownload: ${torboxErr.message || String(torboxErr)}`,
+                fileName,
+                fileSize: fileBytes.length,
+                attempts: attempt
+            }, 502, corsHeaders);
+        }
+
+        const torboxText = await torboxRes.text();
+        let torboxJson;
+        try {
+            torboxJson = JSON.parse(torboxText);
+        } catch (_) {
+            torboxJson = { raw: torboxText, httpStatus: torboxRes.status };
+        }
+
+        const isSuccess = torboxRes.ok && (torboxJson.success === undefined || torboxJson.success !== false);
+
+        if (isSuccess) {
+            const season = meta && meta.season != null ? String(meta.season) : "0";
+            const episode = meta && meta.episode != null ? String(meta.episode) : "0";
+            const downloadKey = `${tmdbId}${season}${episode}`;
+            const torboxDownloadId = (torboxJson && (torboxJson.download_id || torboxJson.usenet_id || (torboxJson.data && torboxJson.data.id))) || null;
+
+            activeDownloads.set(downloadKey, {
+                status: "downloading",
+                tmdbId,
+                season,
+                episode,
+                releaseTitle: cleanRelease,
+                torboxDownloadId,
+                createdAt: Date.now()
+            });
+
+            if (attempt > 1) {
+                try { console.log(`[forwardNzbToTorBox] succeeded on attempt ${attempt}/${MAX_ATTEMPTS} after an earlier transient failure`); } catch (_) { /* ignore */ }
+            }
+            return jsonResponse(Object.assign({ status: "queued" }, torboxJson), 200, corsHeaders);
+        }
+
+        // TorBox explicitly rejected the download (or the response was non-JSON).
+        const isTransient = torboxRes.status >= 500; // 5xx = server-side/transient; 4xx = definitive
+        const retrying = isTransient && attempt < MAX_ATTEMPTS;
+
+        // DIAG: log the FULL raw body to Cloudflare worker logs — this is the exact
+        // message that was previously hidden in the worker relay.
+        try {
+            console.error(`[forwardNzbToTorBox] TORBOX REJECTION attempt=${attempt}/${MAX_ATTEMPTS}: file=${fileName} fileSize=${fileBytes.length} httpStatus=${torboxRes.status} rawBodyBytes=${torboxText.length} rawBody=${torboxText}${retrying ? " — retrying" : ""}`);
         } catch (_) { /* ignore */ }
+
+        if (retrying) {
+            await sleep(BACKOFF_MS[attempt - 1] || BACKOFF_MS[BACKOFF_MS.length - 1]);
+            continue;
+        }
+
+        // Prefer TorBox's human-readable `detail` (e.g. "Failed to create download. Please try
+        // again later.") over the cryptic short `error` code (e.g. "DOWNLOAD_SERVER_ERROR") so the
+        // iOS/Android client log shows something meaningful.
+        const torboxDetail = torboxJson && (torboxJson.detail || torboxJson.message || torboxJson.error);
+        const torboxCode = torboxJson && torboxJson.error;
         return jsonResponse({
-            error: `Failed to reach TorBox createusenetdownload: ${torboxErr.message || String(torboxErr)}`,
+            error: torboxDetail || `TorBox returned HTTP ${torboxRes.status}`,
+            torboxCode: torboxCode || null,
+            torboxHttpStatus: torboxRes.status,
+            torbox: torboxJson,
             fileName,
-            fileSize: fileBytes.length
+            fileSize: fileBytes.length,
+            attempts: attempt
         }, 502, corsHeaders);
     }
-
-    const torboxText = await torboxRes.text();
-    let torboxJson;
-    try {
-        torboxJson = JSON.parse(torboxText);
-    } catch (_) {
-        torboxJson = { raw: torboxText, httpStatus: torboxRes.status };
-    }
-
-    const isSuccess = torboxRes.ok && (torboxJson.success === undefined || torboxJson.success !== false);
-
-    if (isSuccess) {
-        const season = meta && meta.season != null ? String(meta.season) : "0";
-        const episode = meta && meta.episode != null ? String(meta.episode) : "0";
-        const downloadKey = `${tmdbId}${season}${episode}`;
-        const torboxDownloadId = (torboxJson && (torboxJson.download_id || torboxJson.usenet_id || (torboxJson.data && torboxJson.data.id))) || null;
-
-        activeDownloads.set(downloadKey, {
-            status: "downloading",
-            tmdbId,
-            season,
-            episode,
-            releaseTitle: cleanRelease,
-            torboxDownloadId,
-            createdAt: Date.now()
-        });
-
-        return jsonResponse(Object.assign({ status: "queued" }, torboxJson), 200, corsHeaders);
-    }
-
-    // DIAG: TorBox explicitly rejected the download (or the response was non-JSON).
-    // Log the FULL raw body to Cloudflare worker logs — this is the exact message that was
-    // previously hidden in the worker relay.
-    try {
-        console.error(`[forwardNzbToTorBox] TORBOX REJECTION: file=${fileName} fileSize=${fileBytes.length} httpStatus=${torboxRes.status} rawBodyBytes=${torboxText.length} rawBody=${torboxText}`);
-    } catch (_) { /* ignore */ }
-    // Prefer TorBox's human-readable `detail` (e.g. "Failed to create download. Please try
-    // again later.") over the cryptic short `error` code (e.g. "DOWNLOAD_SERVER_ERROR") so the
-    // iOS/Android client log shows something meaningful.
-    const torboxDetail = torboxJson && (torboxJson.detail || torboxJson.message || torboxJson.error);
-    const torboxCode = torboxJson && torboxJson.error;
-    return jsonResponse({
-        error: torboxDetail || `TorBox returned HTTP ${torboxRes.status}`,
-        torboxCode: torboxCode || null,
-        torboxHttpStatus: torboxRes.status,
-        torbox: torboxJson,
-        fileName,
-        fileSize: fileBytes.length
-    }, 502, corsHeaders);
 }
 
 function normalize(str) {
