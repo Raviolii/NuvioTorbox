@@ -149,7 +149,7 @@ function getSettings() {
     treasureMapsApiKey: clean(CODE_TREASUREMAPS_API_KEY) || clean(settings.treasureMapsApiKey),
     workerUrl: clean(CODE_WORKER_URL) || clean(settings.workerUrl),
     languageMode: clean(settings.languageMode) || "de_first",
-    chunkSizeKB: toInt(settings.chunkSizeKB, 768),
+    chunkSizeKB: toInt(settings.chunkSizeKB, 350),
     uploadConcurrency: toInt(settings.uploadConcurrency, 3)
   };
 }
@@ -216,15 +216,44 @@ function fetchJson(url, headers = {}) {
 
 function readBodyAsBytes(response) {
   return __async(this, null, function* () {
-    // ORDER MATTERS FOR iOS: Nuvio on iOS runs in WebKit (WKWebView). There,
-    // `response.body.getReader()` exists but the cross-origin stream often
-    // yields 0 bytes, while `response.arrayBuffer()` reliably returns the full
-    // body. So we try arrayBuffer()/text() FIRST (works on iOS + PC + Node),
-    // and only use the Web ReadableStream as a last resort — with a 0-byte
-    // guard so an empty stream falls through instead of returning nothing.
-    // This is why PC worked but iOS returned "Empty NZB body" / results=0.
+    // STRATEGY: read the FULL body by STREAMING it in chunks via the Web
+    // ReadableStream reader, accumulating each chunk into the complete file.
+    // This is what lets us download NZBs LARGER than Nuvio's ~1 MB single-buffer
+    // ceiling (1,048,576 bytes). A single response.arrayBuffer() call is capped at
+    // that ceiling inside Nuvio's webview, which silently truncated large NZBs
+    // mid-XML and made TorBox fail with a 500 (DOWNLOAD_SERVER_ERROR).
+    // The older, proven client did exactly this streamed read (OldTorbox.js:246-333).
+    //
+    // We still KEEP arrayBuffer()/text() as fallbacks: on iOS the cross-origin
+    // stream can yield 0 bytes (WebKit quirk), in which case arrayBuffer() is the
+    // best we can do for bodies up to the ~1 MB ceiling — and the worker's
+    // repairTruncatedNzb() turns even that into a valid (partial) download
+    // instead of a hard 500.
+    if (response && response.body && typeof response.body.getReader === "function") {
+      try {
+        const reader = response.body.getReader();
+        const parts = [];
+        let total = 0;
+        while (true) {
+          const readResult = yield reader.read();
+          if (readResult.done) break;
+          if (readResult.value && readResult.value.length > 0) {
+            const piece = new Uint8Array(readResult.value);
+            parts.push(piece);
+            total += piece.length;
+          }
+        }
+        if (total > 0) {
+          const out = new Uint8Array(total);
+          let off = 0;
+          for (const p of parts) { out.set(p, off); off += p.length; }
+          return out;
+        }
+        // Stream yielded 0 bytes (e.g. iOS cross-origin) — fall through to arrayBuffer.
+      } catch (_) { /* fall through to the non-streaming fallbacks */ }
+    }
 
-    // 1) Response.arrayBuffer() — the most reliable across WebKit / Chromium / undici.
+    // FALLBACK 1) Response.arrayBuffer() — reliable on iOS for bodies up to the ~1 MB ceiling.
     if (response && typeof response.arrayBuffer === "function") {
       try {
         const buf = yield response.arrayBuffer();
@@ -232,7 +261,7 @@ function readBodyAsBytes(response) {
       } catch (_) { /* fall through */ }
     }
 
-    // 2) Response.text() then UTF-8 encode (fallback if arrayBuffer is unavailable/empty).
+    // FALLBACK 2) Response.text() then UTF-8 encode (if arrayBuffer is unavailable/empty).
     if (response && typeof response.text === "function") {
       try {
         const txt = yield response.text();
@@ -240,7 +269,7 @@ function readBodyAsBytes(response) {
       } catch (_) { /* fall through */ }
     }
 
-    // 3) Body already materialized (Uint8Array / ArrayBuffer / Buffer / string).
+    // FALLBACK 3) Body already materialized (Uint8Array / ArrayBuffer / Buffer / string).
     const b = response && response.body;
     if (b) {
       if (b instanceof Uint8Array && b.length > 0) return b;
@@ -251,27 +280,7 @@ function readBodyAsBytes(response) {
       }
     }
 
-    // 4) LAST resort: Web ReadableStream (Chromium / Node 18+). Guard against 0 bytes.
-    if (response && response.body && typeof response.body.getReader === "function") {
-      try {
-        const reader = response.body.getReader();
-        const parts = [];
-        while (true) {
-          const readResult = yield reader.read();
-          if (readResult.done) break;
-          if (readResult.value && readResult.value.length > 0) parts.push(new Uint8Array(readResult.value));
-        }
-        const total = parts.reduce((n, p) => n + p.length, 0);
-        if (total > 0) {
-          const out = new Uint8Array(total);
-          let off = 0;
-          for (const p of parts) { out.set(p, off); off += p.length; }
-          return out;
-        }
-      } catch (_) { /* fall through */ }
-    }
-
-    throw new Error("No readable NZB body available (tried arrayBuffer, text, body, stream).");
+    throw new Error("No readable NZB body available (tried stream, arrayBuffer, text, body).");
   });
 }
 
@@ -335,7 +344,8 @@ function uploadNzbToWorker(cleanWorkerUrl, nzbBytes, metadata, opts = {}) {
     // The true X-Total-Chunks is still sent on every chunk, which the worker
     // needs to know when the complete file has arrived.
     const TIZEN_CHUNK_SIZE = 350 * 1024;
-    const chunkSize = Math.max(16 * 1024, isTizen ? TIZEN_CHUNK_SIZE : (opts.chunkSize || (768 * 1024)));
+    // Always send in 350 KB chunks — the size proven safe with Nuvio's webview.
+    const chunkSize = Math.max(16 * 1024, isTizen ? TIZEN_CHUNK_SIZE : (opts.chunkSize || (350 * 1024)));
     const concurrency = Math.max(1, isTizen ? 1 : (opts.concurrency || 3));
     const maxRetries = isTizen ? (opts.maxRetries != null ? Math.max(opts.maxRetries, 3) : 3) : (opts.maxRetries != null ? opts.maxRetries : 2);
 
@@ -436,7 +446,7 @@ function queueNzbToTorBoxFromDevice(downloadUrl, releaseTitle, apiKey, metadata 
     }
 
     return uploadNzbToWorker(cleanWorkerUrl, nzbBytes, metadata, {
-      chunkSize: (settings.chunkSizeKB || 768) * 1024,
+      chunkSize: (settings.chunkSizeKB || 350) * 1024,
       concurrency: settings.uploadConcurrency || 3
     });
   });
@@ -743,7 +753,7 @@ function onSettings() {
     { type: "text", key: "treasureMapsApiKey", label: "Treasure Maps API Key", placeholder: "Enter Treasure Maps API key", description: "Used unless overridden by the in-code CODE_TREASUREMAPS_API_KEY constant." },
     { type: "text", key: "workerUrl", label: "TorBox Worker URL", placeholder: "https://your-worker.workers.dev", description: "Cloudflare Worker URL handling lookups and relays. Used unless overridden by the in-code CODE_WORKER_URL constant." },
     { type: "text", key: "languageMode", label: "Language Mode", placeholder: "de_first (or de_only)", description: "Set to 'de_first' for German first, or 'de_only' for strictly German." },
-    { type: "text", key: "chunkSizeKB", label: "Upload Chunk Size (KB)", placeholder: "768", description: "KB per chunk. Larger = fewer round trips = faster. Keep around 1024 or below for safety. (Tizen TVs always use 350 KB automatically.)" },
+    { type: "text", key: "chunkSizeKB", label: "Upload Chunk Size (KB)", placeholder: "350", description: "KB per chunk. 350 KB is the safe default (proven with Nuvio). Larger = fewer round trips but riskier; keep at 1024 or below." },
     { type: "text", key: "uploadConcurrency", label: "Upload Concurrency", placeholder: "3", description: "How many chunks upload at once. 1 = sequential (safest). Higher = faster; lower if uploads fail. (Tizen TVs always use 1 — sequential — automatically.)" }
   ];
 }

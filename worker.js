@@ -213,12 +213,32 @@ export default {
                     // resend the final chunk and we re-forward the same
                     // assembled file (chunk counting is idempotent, so this is
                     // safe and can't double-upload).
+                    // Nuvio serves NZBs through a buffer capped at ~1 MB (1,048,576 bytes);
+                    // a release whose NZB is larger gets silently truncated, leaving the XML
+                    // cut off mid-file. TorBox's Usenet parser then fails with an opaque 500
+                    // (DOWNLOAD_SERVER_ERROR / "Failed to create download. Please try again
+                    // later."). Because the truncated input is identical every time, retrying
+                    // can NEVER succeed — so we must repair the XML, not just retry it.
+                    //
+                    // This restores the well-formed-XML fix the older client had, in the one
+                    // place it helps every client (iOS/Tizen/PC) at once: the worker.
+                    const assembledBytes = fullNzb.length;
+                    let nzbToSend = fullNzb;
+                    let nzbRepair = { repaired: false, reason: "skip" };
+                    try {
+                        nzbRepair = repairTruncatedNzb(fullNzb);
+                        nzbToSend = nzbRepair.bytes;
+                    } catch (_) {
+                        nzbRepair = { repaired: false, reason: "repair_error" };
+                        nzbToSend = fullNzb; // never let a repair failure block the forward
+                    }
+
                     // DIAG: capture full session state right before the forward so Cloudflare
                     // worker logs record exactly what the worker assembled and was about to send.
                     try {
-                        console.log(`[upload-chunk] forwarding to TorBox session=${sessionId} received=${session.received}/${totalChunks} assembledBytes=${fullNzb.length} chunkSizes=[${session.chunks.map(c => (c ? c.length : "-")).join(",")}] hasChunks=[${session.chunks.map(k => (k ? 1 : 0)).join("")}] file=${session.metadata && session.metadata.fileName || "?"}`);
+                        console.log(`[upload-chunk] forwarding to TorBox session=${sessionId} received=${session.received}/${totalChunks} assembledBytes=${assembledBytes} repaired=${nzbRepair.repaired} repairReason=${nzbRepair.reason} sendBytes=${nzbToSend.length} chunkSizes=[${session.chunks.map(c => (c ? c.length : "-")).join(",")}] hasChunks=[${session.chunks.map(k => (k ? 1 : 0)).join("")}] file=${session.metadata && session.metadata.fileName || "?"}`);
                     } catch (_) { /* never let logging break the request */ }
-                    const forwardResult = await forwardNzbToTorBox(fullNzb, meta, torboxApiKey.trim(), corsHeaders);
+                    const forwardResult = await forwardNzbToTorBox(nzbToSend, meta, torboxApiKey.trim(), corsHeaders);
                     if (forwardResult.status === 200) {
                         sessions.delete(sessionId);
                     } else {
@@ -429,6 +449,55 @@ async function getDirectLink(match, apiKey) {
     } catch {
         return null;
     }
+}
+
+/**
+ * Nuvio caps its NZB delivery buffer at ~1 MB (1,048,576 bytes). Releases whose
+ * NZB is larger than that are delivered truncated, so the document ends mid-element
+ * and is no longer well-formed XML. TorBox's Usenet parser rejects such input with an
+ * opaque 500 ("DOWNLOAD_SERVER_ERROR" / "Failed to create download. Please try again
+ * later."). The truncated bytes are identical on every attempt, so retrying cannot fix
+ * it — the file has to be made well-formed.
+ *
+ * Restore the closing tags the way the older client did: when the closing </nzb> tag
+ * is missing, keep the largest valid prefix (up to the last complete <segment>, which
+ * still carries a matching CRC32) and close </segments></file></nzb>. NZBs under the
+ * ceiling already contain </nzb> and pass through unchanged.
+ *
+ * @param {Uint8Array} nzbBytes
+ * @returns {{ bytes: Uint8Array, repaired: boolean, reason: string }}
+ */
+function repairTruncatedNzb(nzbBytes) {
+    let text;
+    try {
+        text = Buffer.from(nzbBytes).toString("utf8");
+    } catch (_) {
+        return { bytes: nzbBytes, repaired: false, reason: "decode_failed" };
+    }
+    if (!text) return { bytes: nzbBytes, repaired: false, reason: "empty" };
+
+    // Already well-formed — nothing to do (covers every NZB under the 1 MB ceiling).
+    if (text.includes("</nzb>")) return { bytes: nzbBytes, repaired: false, reason: "ok" };
+
+    let repairedText;
+    let reason;
+    const lastSeg = text.lastIndexOf("</segment>");
+    if (lastSeg !== -1) {
+        // Drop the dangling partial segment and close cleanly.
+        repairedText = text.slice(0, lastSeg + "</segment>".length) + "\n</segments>\n</file>\n</nzb>";
+        reason = "closed_after_segment";
+    } else {
+        const lastFile = text.lastIndexOf("</file>");
+        if (lastFile !== -1) {
+            repairedText = text.slice(0, lastFile + "</file>".length) + "\n</nzb>";
+            reason = "closed_after_file";
+        } else {
+            repairedText = text + "\n</segments>\n</file>\n</nzb>";
+            reason = "appended_closers";
+        }
+    }
+
+    return { bytes: Buffer.from(repairedText, "utf8"), repaired: true, reason };
 }
 
 async function forwardNzbToTorBox(fullNzb, meta, torboxApiKey, corsHeaders) {
