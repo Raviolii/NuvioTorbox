@@ -207,9 +207,20 @@ export default {
                             offset += session.chunks[i].length;
                         }
                     }
-                    sessions.delete(sessionId);
-
-                    return await forwardNzbToTorBox(fullNzb, meta, torboxApiKey.trim(), corsHeaders);
+                    // Only drop the session once TorBox has accepted the NZB.
+                    // If forwarding fails (network blip, TorBox 5xx, ...), keep
+                    // the session and release the lock so the client can simply
+                    // resend the final chunk and we re-forward the same
+                    // assembled file (chunk counting is idempotent, so this is
+                    // safe and can't double-upload).
+                    const forwardResult = await forwardNzbToTorBox(fullNzb, meta, torboxApiKey.trim(), corsHeaders);
+                    if (forwardResult.status === 200) {
+                        sessions.delete(sessionId);
+                    } else {
+                        session.resolving = false;
+                        session.createdAt = Date.now(); // refresh TTL for the retry window
+                    }
+                    return forwardResult;
                 }
 
                 return jsonResponse({ status: "chunk_received", chunkIndex, received: session.received, totalChunks }, 200, corsHeaders);
