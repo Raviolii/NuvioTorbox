@@ -213,6 +213,11 @@ export default {
                     // resend the final chunk and we re-forward the same
                     // assembled file (chunk counting is idempotent, so this is
                     // safe and can't double-upload).
+                    // DIAG: capture full session state right before the forward so Cloudflare
+                    // worker logs record exactly what the worker assembled and was about to send.
+                    try {
+                        console.log(`[upload-chunk] forwarding to TorBox session=${sessionId} received=${session.received}/${totalChunks} assembledBytes=${fullNzb.length} chunkSizes=[${session.chunks.map(c => (c ? c.length : "-")).join(",")}] hasChunks=[${session.chunks.map(k => (k ? 1 : 0)).join("")}] file=${session.metadata && session.metadata.fileName || "?"}`);
+                    } catch (_) { /* never let logging break the request */ }
                     const forwardResult = await forwardNzbToTorBox(fullNzb, meta, torboxApiKey.trim(), corsHeaders);
                     if (forwardResult.status === 200) {
                         sessions.delete(sessionId);
@@ -472,6 +477,10 @@ async function forwardNzbToTorBox(fullNzb, meta, torboxApiKey, corsHeaders) {
             signal: AbortSignal.timeout(30000)
         });
     } catch (torboxErr) {
+        // DIAG: network/timeout/TLS failure reaching TorBox (NOT a TorBox rejection).
+        try {
+            console.error(`[forwardNzbToTorBox] NETWORK/TIMEOUT: file=${fileName} fileSize=${fileBytes.length} err=${torboxErr.message || String(torboxErr)} name=${torboxErr && torboxErr.name}`);
+        } catch (_) { /* ignore */ }
         return jsonResponse({
             error: `Failed to reach TorBox createusenetdownload: ${torboxErr.message || String(torboxErr)}`,
             fileName,
@@ -508,8 +517,21 @@ async function forwardNzbToTorBox(fullNzb, meta, torboxApiKey, corsHeaders) {
         return jsonResponse(Object.assign({ status: "queued" }, torboxJson), 200, corsHeaders);
     }
 
+    // DIAG: TorBox explicitly rejected the download (or the response was non-JSON).
+    // Log the FULL raw body to Cloudflare worker logs — this is the exact message that was
+    // previously hidden in the worker relay.
+    try {
+        console.error(`[forwardNzbToTorBox] TORBOX REJECTION: file=${fileName} fileSize=${fileBytes.length} httpStatus=${torboxRes.status} rawBodyBytes=${torboxText.length} rawBody=${torboxText}`);
+    } catch (_) { /* ignore */ }
+    // Prefer TorBox's human-readable `detail` (e.g. "Failed to create download. Please try
+    // again later.") over the cryptic short `error` code (e.g. "DOWNLOAD_SERVER_ERROR") so the
+    // iOS/Android client log shows something meaningful.
+    const torboxDetail = torboxJson && (torboxJson.detail || torboxJson.message || torboxJson.error);
+    const torboxCode = torboxJson && torboxJson.error;
     return jsonResponse({
-        error: (torboxJson && (torboxJson.error || torboxJson.message)) || `TorBox returned HTTP ${torboxRes.status}`,
+        error: torboxDetail || `TorBox returned HTTP ${torboxRes.status}`,
+        torboxCode: torboxCode || null,
+        torboxHttpStatus: torboxRes.status,
         torbox: torboxJson,
         fileName,
         fileSize: fileBytes.length
