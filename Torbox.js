@@ -347,37 +347,64 @@ function uploadNzbToWorker(cleanWorkerUrl, nzbBytes, metadata, opts = {}) {
     const sessionId = `nuvio-stream-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const metaHeader = encodeURIComponent(JSON.stringify(metadata || {}));
 
-    const results = [];
-    for (let start = 0; start < totalChunks; start += concurrency) {
-      const end = Math.min(start + concurrency, totalChunks);
-      const batch = [];
-      for (let i = start; i < end; i++) {
-        batch.push(
-          postChunk(
-            cleanWorkerUrl,
-            sessionId,
-            i,
-            totalChunks,
-            nzbBytes.slice(i * chunkSize, (i + 1) * chunkSize),
-            metaHeader,
-            maxRetries
-          )
-        );
+    // The Worker assembles the chunks and, when the final chunk arrives,
+    // forwards the full NZB to TorBox. That forwarding step can fail
+    // transiently (network blip, TorBox 5xx). In that case the Worker KEEPS
+    // its session, so we can simply resend the chunks (its chunk counting is
+    // idempotent) to re-trigger the forward. One full round per attempt.
+    const MAX_ROUNDS = isTizen ? 3 : 2;
+    let lastError = null;
+
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+      const results = [];
+      let roundError = null;
+      try {
+        for (let start = 0; start < totalChunks; start += concurrency) {
+          const end = Math.min(start + concurrency, totalChunks);
+          const batch = [];
+          for (let i = start; i < end; i++) {
+            batch.push(
+              postChunk(
+                cleanWorkerUrl,
+                sessionId,
+                i,
+                totalChunks,
+                nzbBytes.slice(i * chunkSize, (i + 1) * chunkSize),
+                metaHeader,
+                maxRetries
+              )
+            );
+          }
+          const batchResults = yield Promise.all(batch);
+          for (const r of batchResults) results.push(r);
+        }
+      } catch (err) {
+        // A chunk (usually the final one) kept failing — carry its detail
+        // (it contains the Worker's actual error, e.g. the TorBox response).
+        roundError = err;
       }
-      const batchResults = yield Promise.all(batch);
-      for (const r of batchResults) results.push(r);
+
+      if (!roundError) {
+        const nonAck = results.filter((r) => r.json && r.json.status !== "chunk_received");
+        if (nonAck.length > 0) {
+          const finalJson = nonAck[0].json;
+          if (finalJson.error || finalJson.success === false) {
+            throw new Error(`TorBox upload rejected: ${finalJson.error || JSON.stringify(finalJson)}`);
+          }
+          return finalJson;
+        }
+        lastError = new Error("Worker accepted all chunks but the TorBox forward did not complete (transient failure).");
+      } else {
+        lastError = roundError;
+      }
+
+      if (round < MAX_ROUNDS - 1) {
+        console.log(`[TreasureMaps] Upload round ${round + 1}/${MAX_ROUNDS} did not reach TorBox — resending chunks to retry the forward.`);
+        yield waitMs(1000 * (round + 1));
+      }
     }
 
-    const nonAck = results.filter((r) => r.json && r.json.status !== "chunk_received");
-    if (nonAck.length > 0) {
-      const finalJson = nonAck[0].json;
-      if (finalJson.error || finalJson.success === false) {
-        throw new Error(`TorBox upload rejected: ${finalJson.error || JSON.stringify(finalJson)}`);
-      }
-      return finalJson;
-    }
-
-    throw new Error("Chunked upload completed but no final TorBox response was received.");
+    throw new Error(`Chunked upload to TorBox failed after ${MAX_ROUNDS} round(s): ${lastError && (lastError.message || lastError)}`);
   });
 }
 
